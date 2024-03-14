@@ -50,6 +50,10 @@ struct bgpq_expander {
 	RB_HEAD(tentree, sx_tentry) already, stoplist;
 	int family;
 	char* sources;
+        int search_default;
+        char* user_sources_cmd;
+        char* default_sources_cmd;
+	int user_srcs;
 	uint32_t asnumber;
 	int aswidth, asdot;
 	char* name;

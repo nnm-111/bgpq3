@@ -63,6 +63,8 @@ usage(int ecode)
 		"(Cisco IOS by default)\n");
 	printf(" -n        : generate config for Nokia SR OS MD-CLI (Cisco IOS "
 		"by default)\n");
+	printf(" -o        : Fallback mode if sources specified in -S option "
+		"returns empty AS-SET\n");
 	printf(" -P        : generate prefix-list (default, just for backward"
 		" compatibility)\n");
 	printf(" -R len    : allow more specific routes up to specified masklen\n");
@@ -152,7 +154,7 @@ main(int argc, char* argv[])
 	if (getenv("IRRD_SOURCES"))
 		expander.sources=getenv("IRRD_SOURCES");
 
-	while((c=getopt(argc,argv,"2346a:AbBdDEF:HS:jJf:l:L:m:M:NnW:Ppr:R:G:tTh:UwXxsz"))
+	while((c=getopt(argc,argv,"2346a:AbBdDEF:HS:jJf:l:L:m:M:NnW:Ppr:R:G:tTh:UwXxszo:"))
 		!=EOF) {
 	switch(c) {
 		case '2':
@@ -320,6 +322,8 @@ main(int argc, char* argv[])
 			break;
 		case 'n': if(expander.vendor) vendor_exclusive();
 			expander.vendor=V_NOKIA_MD;
+			break;
+		case 'o': expander.search_default=1;
 			break;
 		case 't':
 			if(expander.generation) exclusive();

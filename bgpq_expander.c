@@ -30,6 +30,8 @@ int debug_expander=0;
 int pipelining=1;
 int expand_as23456=0;
 int expand_special_asn=0;
+const char sources_request[]="!s-lc\n";
+const char sources_cmd[]="!s";
 
 static inline int
 tentry_cmp(struct sx_tentry* a, struct sx_tentry* b)
@@ -256,6 +258,9 @@ struct bgpq_request* bgpq_pipeline(struct bgpq_expander* b,
 int bgpq_expand_irrd(struct bgpq_expander* b,
 	int (*callback)(char*, struct bgpq_expander* b, struct bgpq_request* req),
 	void* udata, char* fmt, ...);
+void call_bgpq_expand_irrd(struct bgpq_expander* b,
+	int (*callback)(char*, struct bgpq_expander*, struct bgpq_request* ),
+	void* udata, char* fmt, ...);
 
 int
 bgpq_expanded_macro_limit(char* as, struct bgpq_expander* b,
@@ -280,7 +285,7 @@ bgpq_expanded_macro_limit(char* as, struct bgpq_expander* b,
 				req1->depth = req->depth+1;
 			} else {
 				b->cdepth++;
-				bgpq_expand_irrd(b, bgpq_expanded_macro_limit, NULL, "!i%s\n",
+				call_bgpq_expand_irrd(b, bgpq_expanded_macro_limit, NULL, "!i%s\n",
 					as);
 				b->cdepth--;
 			};
@@ -634,19 +639,33 @@ have3:
 	return 0;
 };
 
+
+int
+bgpq_expand_irrd_s(struct bgpq_expander* b,
+	int (*callback)(char*, struct bgpq_expander*, struct bgpq_request* ),
+	void* udata, char* request);
+
 int
 bgpq_expand_irrd(struct bgpq_expander* b,
 	int (*callback)(char*, struct bgpq_expander*, struct bgpq_request* ),
 	void* udata, char* fmt, ...)
 {
-	char request[128], response[128];
+	char request[128];
 	va_list ap;
-	int ret, off = 0;
-	struct bgpq_request *req;
-
 	va_start(ap,fmt);
 	vsnprintf(request,sizeof(request),fmt,ap);
 	va_end(ap);
+	return bgpq_expand_irrd_s(b, callback, udata, request);
+}
+
+int
+bgpq_expand_irrd_s(struct bgpq_expander* b,
+	int (*callback)(char*, struct bgpq_expander*, struct bgpq_request* ),
+	void* udata, char* request)
+{
+	char response[128];
+	int ret, off = 0;
+	struct bgpq_request *req;
 
 	req = bgpq_request_alloc(request, callback, udata);
 
@@ -750,6 +769,8 @@ have3:
 		};
 		memset(recvbuffer, 0, togot+2);
 		free(recvbuffer);
+		bgpq_request_free(req);
+		return 0;
 	} else if(response[0]=='C') {
 		/* no data */
 		if (b->validate_asns) bgpq_expander_invalidate_asn(b, request);
@@ -765,8 +786,145 @@ have3:
 		exit(0);
 	};
 	bgpq_request_free(req);
-	return 0;
+	return 1;
 };
+
+char*
+get_irrd_resp_data_f(int fd, char *resp, size_t pre_header_reserve, int readed)
+{ 
+	char *end_of_len;
+	char *buf;
+	long data_size=strtoul(resp+1,&end_of_len,10);
+	if (end_of_len == resp+1) {
+		sx_report(SX_FATAL, "Missed lenghth in IRRd responce\n");
+		exit(1);
+	}
+	buf = malloc(data_size + pre_header_reserve + 2);
+        if (!buf) {
+		sx_report(SX_FATAL, "error allocating %lu bytes: %s\n",
+			data_size + pre_header_reserve + 2, strerror(errno));
+	}
+	memset(buf, 0, data_size + pre_header_reserve + 2);
+	size_t copy_size = readed - (end_of_len - resp + 1);
+	memcpy(buf + pre_header_reserve, end_of_len + 1, copy_size);
+	size_t read_size = data_size - copy_size + 2;
+	char *write_pos = buf + copy_size + pre_header_reserve;
+	while (read_size) {
+		int res = read(fd, write_pos, read_size);
+		if (res <= 0 && errno != EAGAIN) {
+			sx_report(SX_FATAL, "Error while reading IRRd\n");
+		}
+		write_pos += res;
+		read_size -= res;
+	}
+	if (buf[pre_header_reserve + data_size] != 'C') {
+		sx_report(SX_FATAL, "Can not find data trailer in IRRd responce\n");
+	}
+	buf[pre_header_reserve + data_size] = 0;
+	return buf;
+}
+
+char*
+get_irrd_resp_data(int fd, size_t pre_header_reserve)
+{
+	size_t r_h_len = 128;
+	char resp[r_h_len];
+        size_t readed = 0;
+	int res;
+	char *crlf_pos = 0;
+        memset(resp, 0, r_h_len);
+        while(readed < r_h_len && !(crlf_pos = strchr(resp, '\n'))) {
+		res = read(fd, resp + readed, r_h_len - readed);
+		if (res <= 0 && errno != EAGAIN) {
+			sx_report(SX_FATAL, "Error while reading IRRd\n");
+		}
+		readed += res;
+        }
+	if (!crlf_pos) {
+		sx_report(SX_FATAL, "Too long first resonce line\n");
+		exit(1);
+	}
+	switch (resp[0]) {
+	case 'A': return get_irrd_resp_data_f(fd, resp, pre_header_reserve, readed);
+	case 'C': return 0;
+	case 'D': return 0;
+	case 'F': sx_report(SX_FATAL, "IRRd error: %s\n", resp+1);
+	default:
+		sx_report(SX_FATAL, "Unknown IRRd responce code: %c\n", *resp);
+	}
+	return 0;
+}
+	
+void
+expander_save_default_sources(struct bgpq_expander* b)
+{
+	SX_DEBUG(debug_expander,"Requesing list of default sources %s", 
+		sources_request);
+	write(b->fd, sources_request, strlen(sources_request));
+        size_t src_cmd_len = strlen(sources_cmd);
+        b->default_sources_cmd = get_irrd_resp_data(b->fd, src_cmd_len);
+	if (b->default_sources_cmd)
+		memcpy(b->default_sources_cmd, sources_cmd, src_cmd_len);
+	else
+		sx_report(SX_FATAL, "No responce for default sources request");
+}
+
+int
+expander_sources_restricted(struct bgpq_expander* b)
+{
+	return (b->sources && b->sources[0]!=0); 
+};
+
+void
+expander_switch_sources(int fd, char *src_cmd)
+{
+	int slen = 128;
+	char src_resp[slen];
+	SX_DEBUG(debug_expander,"Requesting sources %s", src_cmd);
+	write(fd, src_cmd, strlen(src_cmd));
+	memset(src_resp, 0, slen);
+	read(fd, src_resp, slen);
+	SX_DEBUG(debug_expander,"Got answer %s", src_resp);
+	if(src_resp[0]!='C') {
+		sx_report(SX_ERROR, "Invalid source(s) '%s': %s\n", src_cmd,
+			src_resp);
+		exit(1);
+	};
+};
+
+void
+expander_switch_usr_srcs(struct bgpq_expander* b)
+{
+	expander_switch_sources(b->fd, b->user_sources_cmd);
+	b->user_srcs = 1;
+}
+
+void
+call_bgpq_expand_irrd(struct bgpq_expander* b,
+	int (*callback)(char*, struct bgpq_expander*, struct bgpq_request* ),
+	void* udata, char* fmt, ...)
+{
+	char request[128];
+	va_list ap;
+	va_start(ap,fmt);
+	vsnprintf(request,sizeof(request),fmt,ap);
+	va_end(ap);
+	if (expander_sources_restricted(b) && b->search_default) {
+		if (!b->user_srcs)
+			expander_switch_usr_srcs(b);
+		if (bgpq_expand_irrd_s(b, callback, udata, request) &&
+			b->search_default) {
+			expander_switch_sources(b->fd, b->default_sources_cmd);
+			b->user_srcs = 0;
+			bgpq_expand_irrd_s(b, callback, udata, request);	
+			if (!b->user_srcs)
+				expander_switch_usr_srcs(b);
+		}
+
+	} else {
+		bgpq_expand_irrd_s(b, callback, udata, request);
+	}
+}
 
 int
 bgpq_expand(struct bgpq_expander* b)
@@ -838,24 +996,21 @@ bgpq_expand(struct bgpq_expander* b)
 		exit(1);
 	};
 
-	if(b->sources && b->sources[0]!=0) {
-		int slen = strlen(b->sources)+4;
-		if (slen < 128)
-			slen = 128;
-		char sources[slen];
-		snprintf(sources,sizeof(sources),"!s%s\n", b->sources);
-		SX_DEBUG(debug_expander,"Requesting sources %s", sources);
-		write(fd, sources, strlen(sources));
-		memset(sources, 0, slen);
-		read(fd, sources, slen);
-		SX_DEBUG(debug_expander,"Got answer %s", sources);
-		if(sources[0]!='C') {
-			sx_report(SX_ERROR, "Invalid source(s) '%s': %s\n", b->sources,
-				sources);
-			exit(1);
-		};
+        if(expander_sources_restricted(b)) {
+		if (b->search_default)
+			expander_save_default_sources(b);
+		size_t src_cmd_len = sizeof(sources_cmd) + \
+					sizeof(b->sources) + 2;
+		b->user_sources_cmd = malloc(src_cmd_len);
+        	if (!b->user_sources_cmd) {
+			sx_report(SX_FATAL, "error allocating %du bytes: %s\n", \
+				sizeof(b->sources) + src_cmd_len + 1, \
+				strerror(errno));
+		}
+		snprintf(b->user_sources_cmd, src_cmd_len, "!s%s\n", b->sources);
+		expander_switch_usr_srcs(b);
 	};
-
+		
 	if(b->identify) {
 		char ident[128];
 		snprintf(ident,sizeof(ident),"!n" PACKAGE_STRING "\n");
@@ -875,8 +1030,8 @@ bgpq_expand(struct bgpq_expander* b)
 				bgpq_pipeline(b, bgpq_expanded_macro_limit, NULL, "!i%s\n",
 					mc->text);
 			} else {
-				bgpq_expand_irrd(b, bgpq_expanded_macro_limit, NULL, "!i%s\n",
-					mc->text);
+				call_bgpq_expand_irrd(b, bgpq_expanded_macro_limit, \
+					NULL, "!i%s\n", mc->text);
 			};
 		};
 	};
@@ -953,6 +1108,7 @@ bgpq_expand(struct bgpq_expander* b)
 	};
 	shutdown(fd, SHUT_RDWR);
 	close(fd);
+	if (b->default_sources_cmd) free(b->default_sources_cmd);
 	return 1;
 };
 
